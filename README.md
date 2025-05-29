@@ -31,4 +31,3 @@ CONFLUENCE_OUTPUT_DIR=confluence_backup
 
 ## Notes
 - Use an API Key (token) issued by Atlassian and your Atlassian email address.
-- If you need additional features or encounter issues, let me know.
