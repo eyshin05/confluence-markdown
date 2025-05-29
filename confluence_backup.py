@@ -42,9 +42,11 @@ def download_image(img_url, img_path, auth, page_dir, img_tag=None):
         print(f"Failed to download image {img_url}: {e}")
 
 
-
 def download_attachment(attachment_api, download_dir, filename, auth, page_dir, soup, replace_tag=None):
     try:
+        # Ensure the download_dir exists before writing the file
+        if not os.path.exists(download_dir):
+            os.makedirs(download_dir, exist_ok=True)
         resp = requests.get(attachment_api, auth=auth)
         resp.raise_for_status()
         results = resp.json().get('results', [])
@@ -71,7 +73,6 @@ def download_attachment(attachment_api, download_dir, filename, auth, page_dir, 
     return None
 
 
-
 def process_images_and_files(soup, page, page_dir, base_url, auth):
     img_tags = soup.find_all('img')
     ac_images = soup.find_all('ac:image')
@@ -80,11 +81,11 @@ def process_images_and_files(soup, page, page_dir, base_url, auth):
     img_dir = os.path.join(page_dir, "images")
     file_dir = os.path.join(page_dir, "files")
 
-    # Only create images dir if needed
     if img_tags or ac_images:
         os.makedirs(img_dir, exist_ok=True)
-    # Only create files dir if there are files to download
-    has_files = bool(ac_files or ac_view_files)
+
+    # Track if any file was actually downloaded
+    file_downloaded = False
 
     # Handle normal <img> tags
     for img in img_tags:
@@ -116,25 +117,27 @@ def process_images_and_files(soup, page, page_dir, base_url, auth):
     for ac_link in ac_files:
         ri_attachment = ac_link.find('ri:attachment')
         if ri_attachment and ri_attachment.has_attr('ri:filename'):
-            if not has_files:
-                os.makedirs(file_dir, exist_ok=True)
-                has_files = True
             filename = ri_attachment['ri:filename']
             page_id = page['id']
             attachment_api = f"{base_url}/rest/api/content/{page_id}/child/attachment?filename={filename}"
-            download_attachment(attachment_api, file_dir, filename, auth, page_dir, soup, ac_link)
+            file_path = download_attachment(attachment_api, file_dir, filename, auth, page_dir, soup, ac_link)
+            if file_path:
+                if not file_downloaded:
+                    os.makedirs(file_dir, exist_ok=True)
+                    file_downloaded = True
 
     # Handle <ac:structured-macro ac:name="view-file"> for file download
     for macro in ac_view_files:
         ri_attachment = macro.find('ri:attachment')
         if ri_attachment and ri_attachment.has_attr('ri:filename'):
-            if not has_files:
-                os.makedirs(file_dir, exist_ok=True)
-                has_files = True
             filename = ri_attachment['ri:filename']
             page_id = page['id']
             attachment_api = f"{base_url}/rest/api/content/{page_id}/child/attachment?filename={filename}"
-            download_attachment(attachment_api, file_dir, filename, auth, page_dir, soup, macro)
+            file_path = download_attachment(attachment_api, file_dir, filename, auth, page_dir, soup, macro)
+            if file_path:
+                if not file_downloaded:
+                    os.makedirs(file_dir, exist_ok=True)
+                    file_downloaded = True
 
     return str(soup)
 
