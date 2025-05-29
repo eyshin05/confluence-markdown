@@ -1,7 +1,5 @@
-import html
 import os
 import requests
-import re
 
 from typing import List
 
@@ -9,6 +7,7 @@ import html2text
 
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+
 
 def get_page_children(base_url: str, page_id: str, auth: tuple) -> List[dict]:
     url = f"{base_url}/rest/api/content/{page_id}/child/page?limit=100"
@@ -23,73 +22,129 @@ def get_page_children(base_url: str, page_id: str, auth: tuple) -> List[dict]:
             url = base_url + url
     return children
 
+
 def get_page_content(base_url: str, page_id: str, auth: tuple) -> dict:
     url = f"{base_url}/rest/api/content/{page_id}?expand=body.storage,title"
     resp = requests.get(url, auth=auth)
     resp.raise_for_status()
     return resp.json()
 
+
+def download_image(img_url, img_path, auth, page_dir, img_tag=None):
+    try:
+        resp = requests.get(img_url, auth=auth, headers={"X-Atlassian-Token": "no-check"})
+        resp.raise_for_status()
+        with open(img_path, 'wb') as f:
+            f.write(resp.content)
+        if img_tag is not None:
+            img_tag['src'] = os.path.relpath(img_path, page_dir)
+    except Exception as e:
+        print(f"Failed to download image {img_url}: {e}")
+
+
+
+def download_attachment(attachment_api, download_dir, filename, auth, page_dir, soup, replace_tag=None):
+    try:
+        resp = requests.get(attachment_api, auth=auth)
+        resp.raise_for_status()
+        results = resp.json().get('results', [])
+        if results and '_links' in results[0] and 'download' in results[0]['_links']:
+            download_link = results[0]['_links']['download']
+            if download_link.startswith('/'):
+                download_url = attachment_api.split('/rest/api')[0] + download_link
+            else:
+                download_url = download_link
+            file_path = os.path.join(download_dir, filename)
+            file_resp = requests.get(download_url, auth=auth, headers={"X-Atlassian-Token": "no-check"})
+            file_resp.raise_for_status()
+            with open(file_path, 'wb') as f:
+                f.write(file_resp.content)
+            if replace_tag is not None:
+                new_tag = soup.new_tag('a', href=os.path.relpath(file_path, page_dir))
+                new_tag.string = filename
+                replace_tag.replace_with(new_tag)
+            return file_path
+        else:
+            print(f"Attachment not found for {filename}")
+    except Exception as e:
+        print(f"Failed to download attachment {filename}: {e}")
+    return None
+
+
+
+def process_images_and_files(soup, page, page_dir, base_url, auth):
+    img_tags = soup.find_all('img')
+    ac_images = soup.find_all('ac:image')
+    ac_files = soup.find_all('ac:link')
+    ac_view_files = soup.find_all('ac:structured-macro', {'ac:name': 'view-file'})
+    img_dir = os.path.join(page_dir, "images")
+    file_dir = os.path.join(page_dir, "files")
+
+    # Only create images dir if needed
+    if img_tags or ac_images:
+        os.makedirs(img_dir, exist_ok=True)
+    # Only create files dir if there are files to download
+    has_files = bool(ac_files or ac_view_files)
+
+    # Handle normal <img> tags
+    for img in img_tags:
+        src = img.get('src')
+        if src:
+            if src.startswith('/wiki'):
+                img_url = base_url.rstrip('/') + src
+            elif src.startswith('http'):
+                img_url = src
+            else:
+                continue
+            img_name = os.path.basename(src.split('?')[0])
+            img_path = os.path.join(img_dir, img_name)
+            download_image(img_url, img_path, auth, page_dir, img)
+
+    # Handle <ac:image> tags
+    for ac_img in ac_images:
+        ri_attachment = ac_img.find('ri:attachment')
+        if ri_attachment and ri_attachment.has_attr('ri:filename'):
+            filename = ri_attachment['ri:filename']
+            page_id = page['id']
+            attachment_api = f"{base_url}/rest/api/content/{page_id}/child/attachment?filename={filename}"
+            img_path = download_attachment(attachment_api, img_dir, filename, auth, page_dir, soup)
+            if img_path:
+                new_img_tag = soup.new_tag('img', src=os.path.relpath(img_path, page_dir))
+                ac_img.replace_with(new_img_tag)
+
+    # Handle <ac:link> file attachments
+    for ac_link in ac_files:
+        ri_attachment = ac_link.find('ri:attachment')
+        if ri_attachment and ri_attachment.has_attr('ri:filename'):
+            if not has_files:
+                os.makedirs(file_dir, exist_ok=True)
+                has_files = True
+            filename = ri_attachment['ri:filename']
+            page_id = page['id']
+            attachment_api = f"{base_url}/rest/api/content/{page_id}/child/attachment?filename={filename}"
+            download_attachment(attachment_api, file_dir, filename, auth, page_dir, soup, ac_link)
+
+    # Handle <ac:structured-macro ac:name="view-file"> for file download
+    for macro in ac_view_files:
+        ri_attachment = macro.find('ri:attachment')
+        if ri_attachment and ri_attachment.has_attr('ri:filename'):
+            if not has_files:
+                os.makedirs(file_dir, exist_ok=True)
+                has_files = True
+            filename = ri_attachment['ri:filename']
+            page_id = page['id']
+            attachment_api = f"{base_url}/rest/api/content/{page_id}/child/attachment?filename={filename}"
+            download_attachment(attachment_api, file_dir, filename, auth, page_dir, soup, macro)
+
+    return str(soup)
+
+
 def save_page_content(page: dict, page_dir: str, base_url: str = None, auth: tuple = None):
     title = page['title'].replace('/', '_')
     html_content = page['body']['storage']['value']
-    # Download images if requested
     if base_url and auth:
         soup = BeautifulSoup(html_content, 'html.parser')
-        img_tags = soup.find_all('img')
-        ac_images = soup.find_all('ac:image')
-        img_dir = os.path.join(page_dir, "images")
-        if img_tags or ac_images:
-            os.makedirs(img_dir, exist_ok=True)
-        # Handle normal <img> tags
-        for img in img_tags:
-            src = img.get('src')
-            if src:
-                if src.startswith('/wiki'):
-                    img_url = base_url.rstrip('/') + src
-                elif src.startswith('http'):
-                    img_url = src
-                else:
-                    continue
-                img_name = os.path.basename(src.split('?')[0])
-                img_path = os.path.join(img_dir, img_name)
-                try:
-                    resp = requests.get(img_url, auth=auth, headers={"X-Atlassian-Token": "no-check"})
-                    resp.raise_for_status()
-                    with open(img_path, 'wb') as f:
-                        f.write(resp.content)
-                    img['src'] = os.path.relpath(img_path, page_dir)
-                except Exception as e:
-                    print(f"Failed to download image {img_url}: {e}")
-        # Handle <ac:image> tags
-        for ac_img in ac_images:
-            ri_attachment = ac_img.find('ri:attachment')
-            if ri_attachment and ri_attachment.has_attr('ri:filename'):
-                filename = ri_attachment['ri:filename']
-                page_id = page['id']
-                # Get attachment download link from REST API
-                attachment_api = f"{base_url}/rest/api/content/{page_id}/child/attachment?filename={filename}"
-                try:
-                    resp = requests.get(attachment_api, auth=auth)
-                    resp.raise_for_status()
-                    results = resp.json().get('results', [])
-                    if results and '_links' in results[0] and 'download' in results[0]['_links']:
-                        download_link = results[0]['_links']['download']
-                        if download_link.startswith('/'):
-                            download_url = base_url.rstrip('/') + download_link
-                        else:
-                            download_url = download_link
-                        img_path = os.path.join(img_dir, filename)
-                        img_resp = requests.get(download_url, auth=auth, headers={"X-Atlassian-Token": "no-check"})
-                        img_resp.raise_for_status()
-                        with open(img_path, 'wb') as f:
-                            f.write(img_resp.content)
-                        new_img_tag = soup.new_tag('img', src=os.path.relpath(img_path, page_dir))
-                        ac_img.replace_with(new_img_tag)
-                    else:
-                        print(f"Attachment not found for {filename} on page {page_id}")
-                except Exception as e:
-                    print(f"Failed to download attachment image for {filename}: {e}")
-        html_content = str(soup)
+        html_content = process_images_and_files(soup, page, page_dir, base_url, auth)
     markdown_content = html2text.html2text(html_content)
     # Replace 2 consecutive new lines with one line
     markdown_content = markdown_content.replace('\n\n', '\n')
@@ -99,6 +154,7 @@ def save_page_content(page: dict, page_dir: str, base_url: str = None, auth: tup
     filename = os.path.join(page_dir, f"{title}_{page['id']}.md")
     with open(filename, 'w', encoding='utf-8') as f:
         f.write(markdown_content)
+
 
 def backup_confluence(base_url: str, root_page_id: str, email: str, api_key: str, output_dir: str = 'confluence_backup'):
     os.makedirs(output_dir, exist_ok=True)
@@ -114,6 +170,7 @@ def backup_confluence(base_url: str, root_page_id: str, email: str, api_key: str
         for child in children:
             recurse(child['id'], page_dir)
     recurse(root_page_id, output_dir)
+
 
 if __name__ == "__main__":
     load_dotenv()  # load environment variables from .env file
